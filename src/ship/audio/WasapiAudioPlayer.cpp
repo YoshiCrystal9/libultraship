@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include "ship/audio/WasapiAudioPlayer.h"
+#include "ship/utils/HResultException.h"
 #include <spdlog/spdlog.h>
 
 // These constants are currently missing from the MinGW headers.
@@ -19,7 +20,7 @@ namespace Ship {
 
 void WasapiAudioPlayer::ThrowIfFailed(HRESULT res) {
     if (FAILED(res)) {
-        throw res;
+        throw HResultException(res);
     }
 }
 
@@ -68,7 +69,10 @@ bool WasapiAudioPlayer::SetupStream() {
 
         mStarted = false;
         mInitialized = true;
-    } catch (HRESULT res) { return false; }
+    } catch (const HResultException& e) {
+        SPDLOG_ERROR("WasapiAudioPlayer::SetupStream failed: {}", e.what());
+        return false;
+    }
 
     return true;
 }
@@ -80,12 +84,16 @@ bool WasapiAudioPlayer::DoInit() {
                 CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&mDeviceEnumerator)));
             ThrowIfFailed(mDeviceEnumerator->RegisterEndpointNotificationCallback(this));
         }
-    } catch (HRESULT res) { return false; }
+    } catch (const HResultException& e) {
+        SPDLOG_ERROR("WasapiAudioPlayer::DoInit failed: {}", e.what());
+        return false;
+    }
 
     return true;
 }
 
 void WasapiAudioPlayer::DoClose() {
+    std::lock_guard<std::mutex> lock(mMutex);
     if (mClient) {
         mClient->Stop();
     }
@@ -97,6 +105,7 @@ void WasapiAudioPlayer::DoClose() {
 }
 
 int WasapiAudioPlayer::Buffered() {
+    std::lock_guard<std::mutex> lock(mMutex);
     if (!mInitialized) {
         if (!SetupStream()) {
             return 0;
@@ -106,10 +115,14 @@ int WasapiAudioPlayer::Buffered() {
         UINT32 padding;
         ThrowIfFailed(mClient->GetCurrentPadding(&padding));
         return padding;
-    } catch (HRESULT res) { return 0; }
+    } catch (const HResultException& e) {
+        SPDLOG_ERROR("WasapiAudioPlayer::Buffered failed: {}", e.what());
+        return 0;
+    }
 }
 
 void WasapiAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
+    std::lock_guard<std::mutex> lock(mMutex);
     if (!mInitialized) {
         if (!SetupStream()) {
             return;
@@ -137,7 +150,7 @@ void WasapiAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
             mStarted = true;
             ThrowIfFailed(mClient->Start());
         }
-    } catch (HRESULT res) {}
+    } catch (const HResultException& e) { SPDLOG_ERROR("WasapiAudioPlayer::DoPlay failed: {}", e.what()); }
 }
 
 HRESULT STDMETHODCALLTYPE WasapiAudioPlayer::OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState) {
@@ -155,8 +168,8 @@ HRESULT STDMETHODCALLTYPE WasapiAudioPlayer::OnDeviceRemoved(LPCWSTR pwstrDevice
 HRESULT STDMETHODCALLTYPE WasapiAudioPlayer::OnDefaultDeviceChanged(EDataFlow flow, ERole role,
                                                                     LPCWSTR pwstrDefaultDeviceId) {
     if (flow == eRender && role == eConsole) {
-        // This callback runs on a separate thread,
-        // but it's not important how fast this write takes effect.
+        // This callback runs on a separate thread, so we need to protect mInitialized
+        std::lock_guard<std::mutex> lock(mMutex);
         mInitialized = false;
     }
     return S_OK;

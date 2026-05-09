@@ -23,7 +23,6 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     } else {
         SPDLOG_ERROR("Failed add SDL game controller mappings from \"{}\" ({})", controllerDb, SDL_GetError());
     }
-
 #endif
 
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");

@@ -1,11 +1,22 @@
+From 440ef6c2d43395d1b5c36132d7774bb6f24532ed Mon Sep 17 00:00:00 2001
+From: Tim Schneeberger <tim.schneeberger@outlook.de>
+Date: Sun, 28 Dec 2025 23:46:16 +0100
+Subject: [PATCH] Switch patches
+
+---
+ backends/imgui_impl_sdl2.cpp |  3 ---
+ imconfig.h                   | 11 ++++++++++-
+ imgui.cpp                    |  7 +++++++
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
 diff --git a/backends/imgui_impl_sdl2.cpp b/backends/imgui_impl_sdl2.cpp
-index f3a31c5c..405fede6 100644
+index f3a31c5c..52a67f5a 100644
 --- a/backends/imgui_impl_sdl2.cpp
 +++ b/backends/imgui_impl_sdl2.cpp
 @@ -122,7 +122,7 @@
  #include <emscripten/em_js.h>
  #endif
- 
+
 -#if SDL_VERSION_ATLEAST(2,0,4) && !defined(__EMSCRIPTEN__) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IOS) && !defined(__amigaos4__)
 +#if SDL_VERSION_ATLEAST(2,0,4) && !defined(__EMSCRIPTEN__) && !defined(__SWITCH__) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IOS) && !defined(__amigaos4__)
  #define SDL_HAS_CAPTURE_AND_GLOBAL_MOUSE    1
@@ -21,36 +32,14 @@ index f3a31c5c..405fede6 100644
  #define SDL_HAS_SHOW_WINDOW_ACTIVATION_HINT SDL_VERSION_ATLEAST(2,0,18)
  #if SDL_HAS_VULKAN
  #include <SDL_vulkan.h>
-@@ -845,9 +847,6 @@ static void ImGui_ImplSDL2_UpdateGamepads()
-         bd->WantUpdateGamepadsList = false;
-     }
- 
--    // FIXME: Technically feeding gamepad shouldn't depend on this now that they are regular inputs.
--    if ((io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) == 0)
--        return;
-     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
-     if (bd->Gamepads.Size == 0)
-         return;
 diff --git a/imconfig.h b/imconfig.h
-index a1e29e84..a3bd33ef 100644
+index ee64116f..415f83c1 100644
 --- a/imconfig.h
 +++ b/imconfig.h
-@@ -110,7 +110,7 @@
-         operator MyVec4() const { return MyVec4(x,y,z,w); }
- */
- //---- ...Or use Dear ImGui's own very basic math operators.
--//#define IMGUI_DEFINE_MATH_OPERATORS
-+#define IMGUI_DEFINE_MATH_OPERATORS
- 
- //---- Use 32-bit vertex indices (default is 16-bit) is one way to allow large meshes with more than 64K vertices.
- // Your renderer backend will need to support it (most example renderer backends support both 16/32-bit indices).
-@@ -139,3 +139,12 @@ namespace ImGui
-     void MyFunction(const char* name, MyMatrix44* mtx);
- }
- */
-+
-+// handle https://github.com/ocornut/imgui/issues/1641 the old way
-+#define ImTextureID void*
+@@ -141,3 +141,9 @@ namespace ImGui
+
+ // handle https://github.com/ocornut/imgui/issues/1641 the old way
+ #define ImTextureID void*
 +
 +#ifdef __SWITCH__
 +#define IMGUI_IMPL_OPENGL_LOADER_CUSTOM
@@ -85,3 +74,6 @@ index 573efe24..b4a572f3 100644
  #if defined(__APPLE__)
      const char* args[] { "open", "--", path, NULL };
  #else
+--
+2.52.0
+

@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 #include "ship/Context.h"
 #include "ship/audio/Audio.h"
+#include "ship/utils/StringHelper.h"
 
 #include <imgui_internal.h>
 
@@ -21,37 +22,39 @@ static bool isShowingVirtualKeyboard = false;
 static SwkbdConfig keyboard;
 static char kbBuffer[256] = { 0 };
 
+HidsysUniquePadId uniquePadIds[8];
+
 void DetectAppletMode();
 
 static void on_applet_hook(AppletHookType hook, void* param);
 
 void Ship::Switch::Init(SwitchPhase phase) {
     switch (phase) {
-        case PreInitPhase: {
-            Result rc = socketInitializeDefault();
-// #ifdef DEBUG
-            if (R_SUCCEEDED(rc)){
-                nxlinkStdio();
-            }
-// #endif
+        case PreInitPhase:
             DetectAppletMode();
+            socketInitializeDefault();
+#ifdef DEBUG
+            nxlinkStdio();
+#endif
             break;
-        }
         case PostInitPhase:
             appletInitializeGamePlayRecording();
             appletSetGamePlayRecordingState(true);
             appletHook(&applet_hook_cookie, on_applet_hook, NULL);
+            appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
             if (!hosversionBefore(8, 0, 0)) {
                 clkrstInitialize();
             }
+            hidsysInitialize();
+            padConfigureInput(8, HidNpadStyleSet_NpadStandard);
+            s32 total = 0; // unused
+            hidsysGetUniquePadIds(uniquePadIds, 8, &total);
             break;
     }
 }
 
 void Ship::Switch::Exit() {
-#ifdef DEBUG
     socketExit();
-#endif
     clkrstExit();
     appletSetGamePlayRecordingState(false);
 }
@@ -128,7 +131,7 @@ void Ship::Switch::GetDisplaySize(int* width, int* height) {
 }
 
 void Ship::Switch::ApplyOverclock(void) {
-    SwitchProfiles perfMode = (SwitchProfiles)CVarGetInteger("gSwitchPerfMode", (int)Ship::MAXIMUM);
+    SwitchProfiles perfMode = (SwitchProfiles)CVarGetInteger(CVAR_SWITCH_PERF_MODE, (int)Ship::MAXIMUM);
 
     if (perfMode >= 0 && perfMode <= Ship::POWERSAVINGM3) {
         if (hosversionBefore(8, 0, 0)) {
@@ -142,20 +145,13 @@ void Ship::Switch::ApplyOverclock(void) {
     }
 }
 
-void Ship::Switch::PrintErrorMessageToScreen(const char* str, ...) {
-    consoleInit(NULL);
-    srand(time(0));
-
-    va_list args;
-    va_start(args, str);
-    vprintf(str, args);
-    va_end(args);
-
-    while (appletMainLoop()) {
-        consoleUpdate(NULL);
-    }
-
-    consoleExit(NULL);
+char* Ship::Switch::GetControllerUUID(int controller) {
+    HidsysUniquePadSerialNumber serial;
+    hidsysGetUniquePadSerialNumber(uniquePadIds[controller], &serial);
+    char* cuid = serial.serial_number;
+    return SDL_strdup(strlen(cuid) >= 14 && cuid[0] == 'X' && cuid[1] == 'C'
+                          ? cuid
+                          : StringHelper::Sprintf("CID%d0000000000", controller).c_str());
 }
 
 static void on_applet_hook(AppletHookType hook, void* param) {
@@ -186,9 +182,16 @@ static void on_applet_hook(AppletHookType hook, void* param) {
                 // reinitialize audio subsystem to fix audio problems after resuming from sleep
                 // see https://github.com/HarbourMasters/Shipwright/issues/3317
                 SPDLOG_INFO("restarting SDL audio system to work around audio problems on resume");
-                Ship::Context::GetInstance()->GetAudio()->SetCurrentAudioBackend(Ship::AudioBackend::SDL);
+                if (auto audio = Ship::Context::GetInstance()->GetAudio(); audio != nullptr) {
+                    // the audio subsystem is not initialized during applet boot
+                    audio->SetCurrentAudioBackend(Ship::AudioBackend::SDL);
+                }
             }
 
+            break;
+
+        case AppletHookType_OnResume:
+            Ship::Switch::ApplyOverclock();
             break;
 
             /* Performance mode */
@@ -197,6 +200,24 @@ static void on_applet_hook(AppletHookType hook, void* param) {
             break;
         default:
             break;
+    }
+}
+
+void Ship::Switch::ShowErrorApplet(const char *format, ...) {
+    ErrorSystemConfig errorConfig = {};
+
+    // Error applet can display up to 2048 bytes
+    char messageBuffer[2048];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(messageBuffer, sizeof(messageBuffer), format, args);
+    va_end(args);
+
+    const Result rc = errorSystemCreate(&errorConfig, messageBuffer, nullptr);
+
+    if (R_SUCCEEDED(rc)) {
+        errorSystemSetResult(&errorConfig, MAKERESULT(400, 1)); // module id, error code
+        errorSystemShow(&errorConfig);
     }
 }
 
@@ -225,17 +246,19 @@ void DetectAppletMode() {
     if (at == AppletType_Application || at == AppletType_SystemApplication)
         return;
 
-    Ship::Switch::PrintErrorMessageToScreen("\x1b[2;2HYou've launched the Ship while in Applet mode."
-                                            "\x1b[4;2HPlease relaunch while in full-memory mode."
-                                            "\x1b[5;2HHold R when opening any game to enter HBMenu."
-                                            "\x1b[44;2H%s.",
-                                            RandomTexts[rand() % 25]);
+    Ship::Switch::ShowErrorApplet("You've launched the Ship while in Applet mode.\n"
+                                  "Please relaunch while in full-memory mode.\n"
+                                  "Hold R when opening any game to enter HBMenu.\n\n"
+                                  "%s.",
+                                  RandomTexts[rand() % 25]);
+    exit(1);
 }
 
-void Ship::Switch::ThrowMissingOTR(std::string OTRPath) {
-    Ship::Switch::PrintErrorMessageToScreen("\x1b[2;2HYou've launched the Ship without the OTR file."
-                                            "\x1b[4;2HPlease relaunch making sure %s exists."
-                                            "\x1b[44;2H%s.",
-                                            OTRPath.c_str(), RandomTexts[rand() % 25]);
+void Ship::Switch::ThrowMissingOTR(std::string otrPath) {
+    Ship::Switch::ShowErrorApplet("You've launched the Ship without an OTR/O2R file.\n"
+                                        "Please relaunch making sure %s exists.\n\n"
+                                        "%s.",
+                                        otrPath.c_str(), RandomTexts[rand() % 25]);
+    exit(2);
 }
 #endif

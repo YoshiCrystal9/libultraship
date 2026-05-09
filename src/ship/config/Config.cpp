@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <unordered_map>
 #include <any>
+#include <spdlog/spdlog.h>
 #include "ship/utils/StringHelper.h"
 #include "ship/Context.h"
 
@@ -204,10 +205,14 @@ void Config::Reload() {
     }
     std::ifstream ifs(mPath);
 
+    mNestedJson = nlohmann::json::object();
+    mFlattenedJson = nlohmann::json::object();
     try {
         mNestedJson = nlohmann::json::parse(ifs);
         mFlattenedJson = mNestedJson.flatten();
-    } catch (...) { mFlattenedJson = nlohmann::json::object(); }
+    } catch (const nlohmann::json::exception& e) {
+        SPDLOG_ERROR("Failed to parse config file {}: {}", mPath, e.what());
+    } catch (const std::exception& e) { SPDLOG_ERROR("Unexpected error loading config file {}: {}", mPath, e.what()); }
 }
 
 void Config::Save() {
@@ -243,6 +248,10 @@ AudioBackend Config::GetCurrentAudioBackend() {
         return AudioBackend::SDL;
     }
 
+    if (backendName == "coreaudio") {
+        return AudioBackend::COREAUDIO;
+    }
+
     if (backendName == "sdl") {
         return AudioBackend::SDL;
     }
@@ -255,6 +264,10 @@ AudioBackend Config::GetCurrentAudioBackend() {
                  backendName);
 #ifdef _WIN32
     return AudioBackend::WASAPI;
+#endif
+
+#ifdef __APPLE__
+    return AudioBackend::COREAUDIO;
 #endif
 
     return AudioBackend::SDL;
@@ -279,6 +292,9 @@ void Config::SetCurrentAudioBackend(AudioBackend backend) {
     switch (backend) {
         case AudioBackend::WASAPI:
             SetString("Window.AudioBackend", "wasapi");
+            break;
+        case AudioBackend::COREAUDIO:
+            SetString("Window.AudioBackend", "coreaudio");
             break;
         case AudioBackend::SDL:
             SetString("Window.AudioBackend", "sdl");
