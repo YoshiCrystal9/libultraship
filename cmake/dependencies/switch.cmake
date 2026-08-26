@@ -1,7 +1,21 @@
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
 # ========= ImGui =========
-target_include_directories(ImGui PRIVATE ${DEVKITPRO}/portlibs/switch/include/ ${DEVKITPRO}/portlibs/switch/include/SDL2)
+target_include_directories(ImGui PUBLIC ${DEVKITPRO}/portlibs/switch/include/)
+
+#=================== SDL3 ===================
+find_package(SDL3 QUIET)
+if (NOT ${SDL3_FOUND})
+    FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY https://github.com/p-sam/SDL.git
+            GIT_TAG switch-sdl-3.4.12-audout
+            OVERRIDE_FIND_PACKAGE
+    )
+    message("SDL3 not found. Downloading now...")
+    FetchContent_MakeAvailable(SDL3)
+    message("SDL3 downloaded to " ${FETCHCONTENT_BASE_DIR}/sdl3-src)
+endif()
 
 #=================== nlohmann-json ===================
 find_package(nlohmann_json QUIET)
@@ -69,3 +83,5 @@ endif()
 if (INCLUDE_MPQ_SUPPORT)
     target_compile_definitions(storm PRIVATE _POSIX_C_SOURCE=200809L)
 endif ()
+
+target_link_libraries(ImGui PUBLIC SDL3::SDL3)

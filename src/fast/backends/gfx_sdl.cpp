@@ -29,7 +29,7 @@
 #include "fast/backends/gfx_metal.h"
 #include "ship/utils/macUtils.h"
 #elif __SWITCH__
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
 #include <switch.h>
 #include <glad/glad.h>
 #include "ship/port/switch/SwitchImpl.h"
@@ -450,7 +450,11 @@ void GfxWindowBackendSDL::Init(const char* gameName, const char* gfxApiName, boo
         SDL_GL_MakeCurrent(mWnd, mCtx);
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
 #ifdef __SWITCH__
-        if (!gladLoadGLLoader(SDL_GL_GetProcAddress)) {
+        auto gladGetProcAddress = [](const char* name) -> void* {
+            return reinterpret_cast<void*>(SDL_GL_GetProcAddress(name));
+        };
+
+        if (!gladLoadGLLoader(gladGetProcAddress)) {
             printf("Failed to initialize glad\n");
         }
 #endif

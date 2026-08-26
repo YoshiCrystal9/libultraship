@@ -19,6 +19,9 @@
 #include "ship/window/gui/Fonts.h"
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/window/gui/resource/GuiTexture.h"
+#if __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
 
 namespace Ship {
 #define TOGGLE_BTN ImGuiKey_F1
