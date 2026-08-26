@@ -3,7 +3,6 @@
 #include "ship/resource/ResourceManager.h"
 #include "ship/resource/Resource.h"
 #include "ship/resource/File.h"
-#include "ship/Context.h"
 #include "ship/utils/binarytools/MemoryStream.h"
 #include "ship/utils/binarytools/BinaryReader.h"
 #include "ship/resource/factory/JsonFactory.h"
@@ -13,7 +12,31 @@
 #include "nlohmann/json.hpp"
 
 namespace Ship {
-ResourceLoader::ResourceLoader() {
+namespace {
+std::string ResolveIdentifierPath(const ResourceIdentifier& identifier,
+                                  const std::shared_ptr<ResourceManager>& resourceManager) {
+    if (identifier.IsPath()) {
+        return identifier.GetPath();
+    }
+
+    if (resourceManager != nullptr && resourceManager->GetArchiveManager() != nullptr) {
+        const std::string* resolvedPath = resourceManager->GetArchiveManager()->HashToString(identifier.GetPathHash());
+        if (resolvedPath != nullptr) {
+            return *resolvedPath;
+        }
+    }
+
+    return std::to_string(identifier.GetPathHash());
+}
+
+std::string DescribeIdentifier(const ResourceIdentifier& identifier,
+                               const std::shared_ptr<ResourceManager>& resourceManager) {
+    return ResolveIdentifierPath(identifier, resourceManager);
+}
+} // namespace
+
+ResourceLoader::ResourceLoader(std::shared_ptr<ResourceManager> resourceManager)
+    : mResourceManager(std::move(resourceManager)) {
     RegisterGlobalResourceFactories();
 }
 
@@ -135,7 +158,8 @@ std::shared_ptr<tinyxml2::XMLDocument> ResourceLoader::CreateXMLReader(std::shar
 
     xmlReader->Parse(binaryReader->ReadCString().data());
     if (xmlReader->Error()) {
-        SPDLOG_ERROR("Failed to parse XML file {}. Error: {}", initData->Path, xmlReader->ErrorStr());
+        SPDLOG_ERROR("Failed to parse XML file {}. Error: {}",
+                     DescribeIdentifier(initData->Identifier, mResourceManager), xmlReader->ErrorStr());
         return nullptr;
     }
 
@@ -144,6 +168,7 @@ std::shared_ptr<tinyxml2::XMLDocument> ResourceLoader::CreateXMLReader(std::shar
 
 std::shared_ptr<ResourceInitData> ResourceLoader::CreateDefaultResourceInitData() {
     auto resourceInitData = std::make_shared<ResourceInitData>();
+    resourceInitData->Identifier = ResourceIdentifier();
     resourceInitData->Id = 0xDEADBEEFDEADBEEF;
     resourceInitData->Type = static_cast<uint32_t>(ResourceType::None);
     resourceInitData->ResourceVersion = -1;
@@ -157,6 +182,12 @@ std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitData(const std
                                                                        std::shared_ptr<File> metaFileToLoad) {
     auto initData = CreateDefaultResourceInitData();
 
+    auto resourceManager = mResourceManager;
+    if (resourceManager == nullptr) {
+        SPDLOG_ERROR("Failed to read resource init data for {}: no ResourceManager available", filePath);
+        return initData;
+    }
+
     // just using metaFileToLoad->Buffer->data() leads to garbage at the end
     // that causes nlohmann to fail parsing, following the pattern used for
     // xml resolves that issue
@@ -164,50 +195,86 @@ std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitData(const std
     auto binaryReader = std::make_shared<BinaryReader>(stream);
     auto parsed = nlohmann::json::parse(binaryReader->ReadCString());
 
+    std::string targetPath = filePath;
     if (parsed.contains("path")) {
-        initData->Path = parsed["path"];
-    } else {
-        initData->Path = filePath;
+        targetPath = parsed["path"];
     }
+
+    initData->Identifier = ResourceIdentifier(targetPath, 0, nullptr);
 
     auto formatString = parsed["format"];
     if (formatString == "XML") {
         initData->Format = RESOURCE_FORMAT_XML;
     }
 
-    initData->Type = Context::GetInstance()->GetResourceManager()->GetResourceLoader()->GetResourceType(parsed["type"]);
+    initData->Type = resourceManager->GetResourceLoader()->GetResourceType(parsed["type"]);
     initData->ResourceVersion = parsed["version"];
+    initData->IsCustom = parsed.value("isCustom", false);
 
     return initData;
 }
 
-std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, std::shared_ptr<File> fileToLoad,
+// Position File::BufferOffset at the resource body. A currently-headed binary resource keeps an OTR
+// header ahead of its body; when init data was supplied externally (a caller or a `.meta`) rather
+// than parsed from that header, skip past it. Headerless buffers (a shader, or any asset once
+// Kenix3/libultraship#1160 removes the header) have no valid byte order / matching type and are left
+// at offset 0. Remove this and its call sites along with the header under #1160.
+static void SetBufferOffset(const std::shared_ptr<File>& file, const std::shared_ptr<ResourceInitData>& initData) {
+    if (file == nullptr || initData->Format != RESOURCE_FORMAT_BINARY || file->Buffer->size() < OTR_HEADER_SIZE) {
+        return;
+    }
+    auto reader = std::make_shared<BinaryReader>(std::make_shared<MemoryStream>(file->Buffer));
+    auto byteOrder = (Endianness)reader->ReadInt8();
+    if (byteOrder != Endianness::Little && byteOrder != Endianness::Big) {
+        return;
+    }
+    reader->SetEndianness(byteOrder);
+    reader->ReadInt8(); // isCustom
+    reader->ReadInt8(); // reserved
+    reader->ReadInt8(); // reserved
+    if (reader->ReadUInt32() == initData->Type) {
+        file->BufferOffset = OTR_HEADER_SIZE;
+    }
+}
+
+std::shared_ptr<IResource> ResourceLoader::LoadResource(const ResourceIdentifier& identifier,
+                                                        std::shared_ptr<File> fileToLoad,
                                                         std::shared_ptr<ResourceInitData> initData) {
-    if (fileToLoad == nullptr) {
-        SPDLOG_ERROR("Failed to load resource: File not loaded");
-        return nullptr;
+    bool legacyInitData = false;
+    if (initData == nullptr && fileToLoad != nullptr) {
+        initData = ReadResourceInitDataLegacy(ResolveIdentifierPath(identifier, mResourceManager), fileToLoad);
+        legacyInitData = true;
     }
 
     if (initData == nullptr) {
-        auto metaFilePath = filePath + ".meta";
-        auto metaFileToLoad = Context::GetInstance()->GetResourceManager()->LoadFileProcess(metaFilePath);
+        SPDLOG_ERROR("Failed to load resource: initData is null");
+        return nullptr;
+    }
 
-        if (metaFileToLoad != nullptr) {
-            auto initDataFromMetaFile = ReadResourceInitData(filePath, metaFileToLoad);
-            fileToLoad = Context::GetInstance()->GetResourceManager()->LoadFileProcess(initDataFromMetaFile->Path);
-            initData = initDataFromMetaFile;
-        } else {
-            initData = ReadResourceInitDataLegacy(filePath, fileToLoad);
-        }
+    if (initData->Identifier.IsPath() && initData->Identifier.GetPath().empty()) {
+        initData->Identifier = identifier;
+    } else if (initData->Identifier.IsHash() && initData->Identifier.GetPathHash() == 0) {
+        initData->Identifier = identifier;
+    }
+
+    if (initData->Identifier.GetOwner() == 0 && identifier.GetOwner() != 0) {
+        initData->Identifier.SetOwner(identifier.GetOwner());
+    }
+    if (initData->Identifier.GetParent() == nullptr) {
+        initData->Identifier.SetParent(identifier.GetParent());
     }
 
     if (fileToLoad == nullptr) {
-        SPDLOG_ERROR("Failed to load file at path {}.", filePath);
+        SPDLOG_ERROR("Failed to load file for resource {}.",
+                     DescribeIdentifier(initData->Identifier, mResourceManager));
         return nullptr;
     }
 
     switch (initData->Format) {
         case RESOURCE_FORMAT_BINARY:
+            if (!legacyInitData) {
+                SetBufferOffset(fileToLoad, initData);
+            }
             fileToLoad->Reader = CreateBinaryReader(fileToLoad, initData);
             break;
         case RESOURCE_FORMAT_XML:
@@ -215,15 +282,19 @@ std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, st
             break;
     }
 
-    // initData->Parent = shared_from_this();
-
     auto factory = GetFactory(initData->Format, initData->Type, initData->ResourceVersion);
     if (factory == nullptr) {
-        SPDLOG_ERROR("LoadResource failed to find factory for the resource at path: {}", initData->Path);
+        SPDLOG_ERROR("LoadResource failed to find factory for resource {}",
+                     DescribeIdentifier(initData->Identifier, mResourceManager));
         return nullptr;
     }
 
     return factory->ReadResource(fileToLoad, initData);
+}
+
+std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, std::shared_ptr<File> fileToLoad,
+                                                        std::shared_ptr<ResourceInitData> initData) {
+    return LoadResource(ResourceIdentifier(std::move(filePath), 0, nullptr), fileToLoad, initData);
 }
 
 uint32_t ResourceLoader::GetResourceType(const std::string& type) {
@@ -233,7 +304,7 @@ uint32_t ResourceLoader::GetResourceType(const std::string& type) {
 std::shared_ptr<ResourceInitData>
 ResourceLoader::ReadResourceInitDataBinary(const std::string& filePath, std::shared_ptr<BinaryReader> headerReader) {
     auto resourceInitData = CreateDefaultResourceInitData();
-    resourceInitData->Path = filePath;
+    resourceInitData->Identifier = ResourceIdentifier(filePath, 0, nullptr);
 
     if (headerReader == nullptr) {
         SPDLOG_ERROR("Error reading OTR header from Binary: No header buffer document for file {}", filePath);
@@ -273,7 +344,7 @@ ResourceLoader::ReadResourceInitDataBinary(const std::string& filePath, std::sha
 std::shared_ptr<ResourceInitData>
 ResourceLoader::ReadResourceInitDataXml(const std::string& filePath, std::shared_ptr<tinyxml2::XMLDocument> document) {
     auto resourceInitData = CreateDefaultResourceInitData();
-    resourceInitData->Path = filePath;
+    resourceInitData->Identifier = ResourceIdentifier(filePath, 0, nullptr);
 
     if (document == nullptr) {
         SPDLOG_ERROR("Error reading OTR header from XML: No XML document for file {}", filePath);
@@ -285,8 +356,12 @@ ResourceLoader::ReadResourceInitDataXml(const std::string& filePath, std::shared
     resourceInitData->Format = RESOURCE_FORMAT_XML;
 
     auto root = document->FirstChildElement();
-    resourceInitData->Type =
-        Context::GetInstance()->GetResourceManager()->GetResourceLoader()->GetResourceType(root->Name());
+    auto resourceManager = mResourceManager;
+    if (resourceManager == nullptr) {
+        SPDLOG_ERROR("Error reading OTR header from XML: No ResourceManager for file {}", filePath);
+        return resourceInitData;
+    }
+    resourceInitData->Type = resourceManager->GetResourceLoader()->GetResourceType(root->Name());
     resourceInitData->ResourceVersion = root->IntAttribute("Version");
 
     return resourceInitData;

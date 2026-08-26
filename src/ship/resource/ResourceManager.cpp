@@ -1,13 +1,16 @@
 #include "ship/resource/ResourceManager.h"
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
 #include "ship/resource/File.h"
 #include "ship/resource/archive/Archive.h"
 #include <algorithm>
 #include <thread>
+#include <stdexcept>
 #include "ship/utils/StringHelper.h"
 #include "ship/utils/Utils.h"
 #include "ship/config/ConsoleVariable.h"
-#include "ship/Context.h"
+#include "ship/security/Keystore.h"
+#include "ship/thread/ThreadPool.h"
 
 namespace Ship {
 
@@ -16,65 +19,40 @@ ResourceFilter::ResourceFilter(const std::list<std::string>& includeMasks, const
     : IncludeMasks(includeMasks), ExcludeMasks(excludeMasks), Owner(owner), Parent(parent) {
 }
 
-size_t ResourceIdentifier::GetHash() const {
-    return mHash;
+ResourceManager::ResourceManager(std::shared_ptr<ThreadPool> threadPool, std::shared_ptr<Keystore> keystore)
+    : Component("ResourceManager"), mThreadPool(std::move(threadPool)), mKeystore(std::move(keystore)) {
 }
 
-ResourceIdentifier::ResourceIdentifier(const std::string& path, const uintptr_t owner,
-                                       const std::shared_ptr<Archive> parent)
-    : Path(path), Owner(owner), Parent(parent) {
-    mHash = CalculateHash();
-}
+void ResourceManager::OnInit(const nlohmann::json& initArgs) {
+    auto archivePaths = initArgs.value("archivePaths", std::vector<std::string>{});
+    auto hashesVec = initArgs.value("validHashes", std::vector<uint32_t>{});
+    std::unordered_set<uint32_t> validHashes(hashesVec.begin(), hashesVec.end());
 
-ResourceIdentifier::ResourceIdentifier(std::string&& path, const uintptr_t owner, const std::shared_ptr<Archive> parent)
-    : Path(std::move(path)), Owner(owner), Parent(parent) {
-    mHash = CalculateHash();
-}
-
-bool ResourceIdentifier::operator==(const ResourceIdentifier& rhs) const {
-    return Owner == rhs.Owner && Path == rhs.Path && Parent == rhs.Parent;
-}
-
-size_t ResourceIdentifier::CalculateHash() {
-    size_t hash = Math::HashCombine(std::hash<std::string>{}(Path), std::hash<std::uintptr_t>{}(Owner));
-    if (Parent != nullptr) {
-        hash = Math::HashCombine(hash, std::hash<std::string>{}(Parent->GetPath()));
-    }
-    return hash;
-}
-
-size_t ResourceIdentifierHash::operator()(const ResourceIdentifier& rcd) const {
-    return rcd.GetHash();
-}
-
-ResourceManager::ResourceManager() {
-}
-
-void ResourceManager::Init(const std::vector<std::string>& archivePaths,
-                           const std::unordered_set<uint32_t>& validHashes, int32_t reservedThreadCount) {
-    mResourceLoader = std::make_shared<ResourceLoader>();
-    mArchiveManager = std::make_shared<ArchiveManager>();
+    mResourceLoader =
+        std::make_shared<ResourceLoader>(std::dynamic_pointer_cast<ResourceManager>(GetSharedComponent()));
+    mArchiveManager =
+        std::make_shared<ArchiveManager>(std::dynamic_pointer_cast<ResourceManager>(GetSharedComponent()), mKeystore);
     GetArchiveManager()->Init(archivePaths, validHashes);
 #if defined(__SWITCH__)
     size_t threadCount = 1;
-#else
-    // the extra `- 1` is because we reserve an extra thread for spdlog
-    size_t threadCount = std::max(1, (int32_t)(std::thread::hardware_concurrency() - reservedThreadCount - 1));
 #endif
-    mThreadPool = std::make_shared<BS::thread_pool>(threadCount);
 
-    if (!IsLoaded()) {
+    if (!mArchiveManager->IsInitialized()) {
         // Nothing ever unpauses the thread pool since nothing will ever try to load the archive again.
-        mThreadPool->pause();
+        auto tpc = GetThreadPool();
+        if (tpc) {
+            tpc->Pause();
+        }
+        throw std::runtime_error("Failed to initialize ArchiveManager");
     }
 }
 
 ResourceManager::~ResourceManager() {
-    SPDLOG_INFO("destruct ResourceManager");
-}
-
-bool ResourceManager::IsLoaded() {
-    return mArchiveManager != nullptr && mArchiveManager->IsLoaded();
+    // Guard against logging after the Logger component (and spdlog) has shut down
+    // during Context teardown.
+    if (spdlog::default_logger()) {
+        SPDLOG_INFO("destruct ResourceManager");
+    }
 }
 
 std::shared_ptr<File> ResourceManager::LoadFileProcess(const std::string& filePath) {
@@ -88,38 +66,99 @@ std::shared_ptr<File> ResourceManager::LoadFileProcess(const std::string& filePa
 }
 
 std::shared_ptr<File> ResourceManager::LoadFileProcess(const ResourceIdentifier& identifier) {
-    if (identifier.Parent == nullptr) {
-        return LoadFileProcess(identifier.Path);
+    if (identifier.GetParent() == nullptr) {
+        if (identifier.IsPath()) {
+            return LoadFileProcess(identifier.GetPath());
+        }
+
+        return LoadFileProcess(identifier.GetPathHash());
     }
-    auto archive = identifier.Parent;
-    auto file = archive->LoadFile(identifier.Path);
+
+    auto archive = identifier.GetParent();
+    std::shared_ptr<File> file =
+        identifier.IsPath() ? archive->LoadFile(identifier.GetPath()) : archive->LoadFile(identifier.GetPathHash());
+
     if (file != nullptr) {
-        SPDLOG_TRACE("Loaded File {} on ResourceManager", identifier.Path);
+        if (identifier.IsPath()) {
+            SPDLOG_TRACE("Loaded File {} on ResourceManager", identifier.GetPath());
+        } else {
+            SPDLOG_TRACE("Loaded File {} on ResourceManager", identifier.GetPathHash());
+        }
     } else {
-        SPDLOG_TRACE("Could not load File {} in ResourceManager", identifier.Path);
+        if (identifier.IsPath()) {
+            SPDLOG_TRACE("Could not load File {} in ResourceManager", identifier.GetPath());
+        } else {
+            SPDLOG_TRACE("Could not load File {} in ResourceManager", identifier.GetPathHash());
+        }
     }
     return file;
 }
 
+std::shared_ptr<File> ResourceManager::LoadFileProcess(uint64_t hash) {
+    auto file = mArchiveManager->LoadFile(hash);
+    if (file != nullptr) {
+        SPDLOG_TRACE("Loaded File {} on ResourceManager", hash);
+    } else {
+        SPDLOG_TRACE("Could not load File {} in ResourceManager", hash);
+    }
+    return file;
+}
+
+std::shared_ptr<ResourceInitData> ResourceManager::ResolveMetaAlias(const ResourceIdentifier& identifier) {
+    const std::string* basePath =
+        identifier.IsPath() ? &identifier.GetPath() : mArchiveManager->HashToString(identifier.GetPathHash());
+    if (basePath == nullptr || basePath->empty()) {
+        return nullptr;
+    }
+
+    auto metaFile = LoadFileProcess({ *basePath + ".meta", identifier.GetOwner(), identifier.GetParent() });
+    if (metaFile == nullptr) {
+        return nullptr;
+    }
+
+    auto metaInitData = GetResourceLoader()->ReadResourceInitData(*basePath, metaFile);
+
+    auto targetIdentifier = metaInitData->Identifier;
+    targetIdentifier.SetOwner(identifier.GetOwner());
+    metaInitData->Identifier = targetIdentifier;
+
+    // Both candidates are ranked by the archive holding them, and the higher one loads. A tie
+    // means one archive supplies both, and there its `.meta` is the more specific instruction.
+    // Nothing at the requested path reports -1, so any reachable target outranks it.
+    const int32_t targetPriority = mArchiveManager->GetFilePriority(targetIdentifier);
+    const int32_t basePriority = mArchiveManager->GetFilePriority(identifier);
+    if (targetPriority < basePriority) {
+        SPDLOG_TRACE("Alias {} -> {} not taken: target ranks {} against {} at the requested path", *basePath,
+                     targetIdentifier.GetPath(), targetPriority, basePriority);
+        return nullptr;
+    }
+
+    return metaInitData;
+}
+
 std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceIdentifier& identifier, bool loadExact,
                                                                 std::shared_ptr<ResourceInitData> initData) {
+    if (initData != nullptr) {
+        initData->Identifier = identifier;
+    }
+
     // Check for and remove the OTR signature
-    if (OtrSignatureCheck(identifier.Path.c_str())) {
-        const auto newFilePath = identifier.Path.substr(7);
-        return LoadResourceProcess({ newFilePath, identifier.Owner, identifier.Parent }, false, initData);
+    if (identifier.IsPath() && OtrSignatureCheck(identifier.GetPath().c_str())) {
+        const auto newFilePath = identifier.GetPath().substr(7);
+        return LoadResourceProcess({ newFilePath, identifier.GetOwner(), identifier.GetParent() }, false, initData);
     }
 
     // Cache the starts_with check to avoid repeated string comparisons
-    const bool isAltPath = identifier.Path.starts_with(IResource::gAltAssetPrefix);
-    const bool shouldCheckAlt = !loadExact && mAltAssetsEnabled && !isAltPath;
+    const bool isAltPath = identifier.IsPath() && identifier.GetPath().starts_with(IResource::gAltAssetPrefix);
+    const bool shouldCheckAlt = identifier.IsPath() && !loadExact && mAltAssetsEnabled && !isAltPath;
 
     // Attempt to load the alternate version of the asset, if we fail then we continue trying to load the standard
     // asset.
     if (shouldCheckAlt) {
         std::string altPath = IResource::gAltAssetPrefix;
-        altPath += identifier.Path;
-        auto altResource =
-            LoadResourceProcess({ std::move(altPath), identifier.Owner, identifier.Parent }, loadExact, initData);
+        altPath += identifier.GetPath();
+        auto altResource = LoadResourceProcess({ std::move(altPath), identifier.GetOwner(), identifier.GetParent() },
+                                               loadExact, initData);
 
         if (altResource != nullptr) {
             return altResource;
@@ -152,16 +191,34 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         }
     }
 
+    // A `.meta` beside this path can name a different file to load in its place
+    std::shared_ptr<File> file = nullptr;
+    if (initData == nullptr) {
+        if (auto metaInitData = ResolveMetaAlias(identifier)) {
+            file = LoadFileProcess(metaInitData->Identifier);
+            if (file != nullptr) {
+                initData = metaInitData;
+            }
+        }
+    }
+
     // Get the file from the OTR
-    auto file = LoadFileProcess(identifier.Path);
     if (file == nullptr) {
-        SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
+        file = LoadFileProcess(identifier);
+    }
+
+    if (file == nullptr) {
+        if (identifier.IsPath()) {
+            SPDLOG_TRACE("Failed to load resource file at path {}", identifier.GetPath());
+        } else {
+            SPDLOG_TRACE("Failed to load resource file at hash {}", identifier.GetPathHash());
+        }
         mResourceCache[identifier] = ResourceLoadError::NotFound;
         return nullptr;
     }
 
     // Transform the raw data into a resource
-    auto resource = GetResourceLoader()->LoadResource(identifier.Path, file, initData);
+    auto resource = GetResourceLoader()->LoadResource(identifier, file, initData);
 
     // Another thread could have loaded the resource while we were processing, so we want to check before setting to
     // the cache.
@@ -185,9 +242,17 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     }
 
     if (resource != nullptr) {
-        SPDLOG_TRACE("Loaded Resource {} on ResourceManager", identifier.Path);
+        if (identifier.IsPath()) {
+            SPDLOG_TRACE("Loaded Resource {} on ResourceManager", identifier.GetPath());
+        } else {
+            SPDLOG_TRACE("Loaded Resource {} on ResourceManager", identifier.GetPathHash());
+        }
     } else {
-        SPDLOG_TRACE("Resource load FAILED {} on ResourceManager", identifier.Path);
+        if (identifier.IsPath()) {
+            SPDLOG_TRACE("Resource load FAILED {} on ResourceManager", identifier.GetPath());
+        } else {
+            SPDLOG_TRACE("Resource load FAILED {} on ResourceManager", identifier.GetPathHash());
+        }
     }
 
     return resource;
@@ -202,9 +267,9 @@ std::shared_future<std::shared_ptr<IResource>>
 ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool loadExact, BS::priority_t priority,
                                    std::shared_ptr<ResourceInitData> initData) {
     // Check for and remove the OTR signature
-    if (OtrSignatureCheck(identifier.Path.c_str())) {
-        auto newFilePath = identifier.Path.substr(7);
-        return LoadResourceAsync({ newFilePath, identifier.Owner, identifier.Parent }, loadExact, priority);
+    if (identifier.IsPath() && OtrSignatureCheck(identifier.GetPath().c_str())) {
+        auto newFilePath = identifier.GetPath().substr(7);
+        return LoadResourceAsync({ newFilePath, identifier.GetOwner(), identifier.GetParent() }, loadExact, priority);
     }
 
     // Check the cache before queueing the job.
@@ -215,7 +280,7 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         return promise->get_future().share();
     }
 
-    return mThreadPool->submit_task(
+    return GetThreadPool()->Get()->submit_task(
         [this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
             return LoadResourceProcess(identifier, loadExact, initData);
         },
@@ -232,7 +297,11 @@ std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifie
                                                          std::shared_ptr<ResourceInitData> initData) {
     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
     if (resource == nullptr) {
-        SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
+        if (identifier.IsPath()) {
+            SPDLOG_TRACE("Failed to load resource file at path {}", identifier.GetPath());
+        } else {
+            SPDLOG_TRACE("Failed to load resource file at hash {}", identifier.GetPathHash());
+        }
     }
     return resource;
 }
@@ -244,20 +313,15 @@ std::shared_ptr<IResource> ResourceManager::LoadResource(const std::string& file
 
 std::shared_ptr<IResource> ResourceManager::LoadResource(uint64_t crc, bool loadExact,
                                                          std::shared_ptr<ResourceInitData> initData) {
-    const std::string* hashStr = GetArchiveManager()->HashToString(crc);
-    if (hashStr == nullptr || hashStr->length() == 0) {
-        SPDLOG_TRACE("ResourceLoad: Unknown crc {}\n", crc);
-        return nullptr;
-    }
-
-    return LoadResource(*hashStr, loadExact, initData);
+    return LoadResource({ crc, mDefaultCacheOwner, mDefaultCacheArchive }, loadExact, initData);
 }
 
 std::variant<ResourceManager::ResourceLoadError, std::shared_ptr<IResource>>
 ResourceManager::CheckCache(const ResourceIdentifier& identifier, bool loadExact) {
-    if (!loadExact && mAltAssetsEnabled && !identifier.Path.starts_with(IResource::gAltAssetPrefix)) {
-        const auto altPath = IResource::gAltAssetPrefix + identifier.Path;
-        auto altCacheResult = CheckCache({ altPath, identifier.Owner, identifier.Parent }, loadExact);
+    if (!loadExact && mAltAssetsEnabled && identifier.IsPath() &&
+        !identifier.GetPath().starts_with(IResource::gAltAssetPrefix)) {
+        const auto altPath = IResource::gAltAssetPrefix + identifier.GetPath();
+        auto altCacheResult = CheckCache({ altPath, identifier.GetOwner(), identifier.GetParent() }, loadExact);
 
         // If the type held at this cache index is a resource, then we return it.
         // Else we attempt to load standard definition assets.
@@ -333,7 +397,7 @@ ResourceManager::LoadResourcesProcess(const ResourceFilter& filter) {
 
 std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
 ResourceManager::LoadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
-    return mThreadPool->submit_task(
+    return GetThreadPool()->Get()->submit_task(
         [this, filter]() -> std::shared_ptr<std::vector<std::shared_ptr<IResource>>> {
             return LoadResourcesProcess(filter);
         },
@@ -354,7 +418,7 @@ std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadRe
 }
 
 void ResourceManager::DirtyResources(const ResourceFilter& filter) {
-    mThreadPool->submit_task([this, filter]() -> void {
+    GetThreadPool()->Get()->submit_task([this, filter]() -> void {
         auto list = GetArchiveManager()->ListFiles(filter.IncludeMasks, filter.ExcludeMasks);
 
         for (const auto& key : *list.get()) {
@@ -378,7 +442,7 @@ void ResourceManager::UnloadResourcesAsync(const std::string& searchMask, BS::pr
 }
 
 void ResourceManager::UnloadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
-    mThreadPool->submit_task([this, filter]() -> void { UnloadResourcesProcess(filter); }, priority);
+    GetThreadPool()->Get()->submit_task([this, filter]() -> void { UnloadResourcesProcess(filter); }, priority);
 }
 
 void ResourceManager::UnloadResources(const std::string& searchMask) {
@@ -426,17 +490,28 @@ size_t ResourceManager::UnloadResource(const std::string& filePath) {
 
 bool ResourceManager::WriteResource(const ResourceIdentifier& identifier, const std::vector<uint8_t>& data,
                                     bool unloadFile) {
-    std::shared_ptr<Archive> archive = identifier.Parent;
+    std::string path;
+    if (identifier.IsPath()) {
+        path = identifier.GetPath();
+    } else {
+        const std::string* resolvedPath = mArchiveManager->HashToString(identifier.GetPathHash());
+        if (resolvedPath == nullptr) {
+            return false;
+        }
+        path = *resolvedPath;
+    }
+
+    std::shared_ptr<Archive> archive = identifier.GetParent();
 
     if (!archive) {
-        archive = mArchiveManager->GetArchiveFromFile(identifier.Path);
+        archive = mArchiveManager->GetArchiveFromFile(path);
     }
 
     if (!archive) {
         return false;
     }
 
-    if (!mArchiveManager->WriteFile(archive, identifier.Path, data)) {
+    if (!mArchiveManager->WriteFile(archive, path, data)) {
         return false;
     }
 
@@ -445,6 +520,23 @@ bool ResourceManager::WriteResource(const ResourceIdentifier& identifier, const 
     }
 
     return true;
+}
+
+bool ResourceManager::WriteResource(uint64_t hash, const std::vector<uint8_t>& data, bool unloadFile) {
+    const std::string* resolvedPath = mArchiveManager->HashToString(hash);
+    if (resolvedPath == nullptr) {
+        return false;
+    }
+
+    ResourceIdentifier identifier(hash, mDefaultCacheOwner, mDefaultCacheArchive);
+
+    auto archive = mArchiveManager->GetArchiveFromFile(*resolvedPath);
+    if (archive == nullptr) {
+        return false;
+    }
+
+    identifier.SetParent(archive);
+    return WriteResource(identifier, data, unloadFile);
 }
 
 bool ResourceManager::OtrSignatureCheck(const char* fileName) {
@@ -518,6 +610,10 @@ void* ResourceManager::GetResourceRawPointer(uint64_t crc) {
     auto resource = LoadResource(crc);
 
     return GetResourceRawPointer(resource);
+}
+
+std::shared_ptr<ThreadPool> ResourceManager::GetThreadPool() {
+    return mThreadPool;
 }
 
 } // namespace Ship

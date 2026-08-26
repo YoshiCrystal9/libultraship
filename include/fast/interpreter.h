@@ -10,14 +10,21 @@
 #include <stack>
 #include <string>
 #include <string_view>
+#include <memory>
 
 #include "fast/lus_gbi.h"
 #include "fast/types.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
+#include "fast/debug/GfxDebugger.h"
 
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"
+
+namespace Ship {
+class ResourceManager;
+class ConsoleVariable;
+} // namespace Ship
 
 // TODO figure out why changing these to 640x480 makes the game only render in a quarter of the window
 #define SCREEN_WIDTH 320
@@ -131,6 +138,7 @@ namespace Fast {
 
 class GfxRenderingAPI;
 class GfxWindowBackend;
+class Fast3dWindow;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
 constexpr size_t SHADER_ID_SHIFT = 17;
@@ -359,6 +367,7 @@ struct FBInfo {
     uint32_t applied_width, applied_height; // Up-scaled for the viewport
     uint32_t native_width, native_height;   // Max "native" size of the screen, used for up-scaling
     bool resize;                            // Scale to match the viewport
+    bool forceFixedAspect;                  // Preserve aspect ratio even if resize is true
 };
 
 struct MaskedTextureEntry {
@@ -372,8 +381,14 @@ class Interpreter {
     ~Interpreter();
 
     void Init(GfxWindowBackend* wapi, class GfxRenderingAPI* rapi, const char* game_name, bool start_in_fullscreen,
-              uint32_t width, uint32_t height, uint32_t posX, uint32_t posY);
+              uint32_t width, uint32_t height, uint32_t posX, uint32_t posY,
+              std::shared_ptr<Ship::ConsoleVariable> consoleVariable = nullptr,
+              std::shared_ptr<Ship::ResourceManager> resourceManager = nullptr);
     void Destroy();
+    void SetGfxDebugger(std::shared_ptr<GfxDebugger> debugger);
+    std::shared_ptr<GfxDebugger> GetGfxDebugger() const;
+    void SetFast3dWindow(std::shared_ptr<Fast3dWindow> window);
+    static std::shared_ptr<Fast3dWindow> GetCurrentWindow();
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY);
     GfxRenderingAPI* GetCurrentRenderingAPI();
     void StartFrame();
@@ -387,7 +402,7 @@ class Interpreter {
     void SetTargetFps(int fps);
     void SetMaxFrameLatency(int latency);
     int CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
-                          uint8_t resize);
+                          uint8_t resize, bool forceFixedAspect = false);
     void SetFrameBuffer(int fb, float noiseScale);
     void CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr);
     void ResetFrameBuffer();
@@ -517,6 +532,10 @@ class Interpreter {
     size_t mBufVboNumTris{};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
+    std::shared_ptr<GfxDebugger> mGfxDebugger;
+    std::shared_ptr<Ship::ResourceManager> mResourceManager; ///< Cached ResourceManager, set in Init().
+    std::shared_ptr<Ship::ConsoleVariable> mConsoleVariable; ///< Cached ConsoleVariable, set in Init().
+    std::weak_ptr<Fast3dWindow> mFast3dWindow;               ///< Cached Fast3dWindow, set in OnInit().
 
     uintptr_t mSegmentPointers[MAX_SEGMENT_POINTERS]{};
 
@@ -555,4 +574,4 @@ const char* GfxGetOpcodeName(int8_t opcode);
 extern "C" void gfx_texture_cache_clear();
 extern "C" void gfx_shader_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
-                                      uint8_t resize);
+                                      uint8_t resize, bool forceFixedAspect = false);

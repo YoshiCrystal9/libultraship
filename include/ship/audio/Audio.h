@@ -3,12 +3,13 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include "ship/audio/AudioBackend.h"
 #include "ship/audio/AudioPlayer.h"
+#include "ship/core/Component.h"
+#include "ship/config/Config.h"
 
 namespace Ship {
-
-/** @brief Identifies the audio backend implementation in use. */
-enum class AudioBackend { WASAPI, SDL, COREAUDIO, NUL };
+class Config;
 
 /**
  * @brief Manages audio playback through a platform-specific AudioPlayer.
@@ -18,25 +19,23 @@ enum class AudioBackend { WASAPI, SDL, COREAUDIO, NUL };
  * SetCurrentAudioBackend(); the channel layout can be changed via SetAudioChannels()
  * without restarting the application.
  *
- * Obtain the instance from Context::GetAudio().
+ * **Required dependencies (constructor-injected):**
+ * - **Config** — cached on the class and used by SetCurrentAudioBackend() to
+ *   load/persist the selected audio backend. Any code path that uses the cached
+ *   Config validates that it exists and is initialized before use.
+ *
+ * Obtain the instance from `Context::GetChildren().GetFirst<Audio>()`.
  */
-class Audio {
+class Audio : public Component {
   public:
     /**
      * @brief Constructs an Audio manager with the given initial settings.
      * @param settings Initial audio backend selection and channel configuration.
      */
-    Audio(AudioSettings settings) : mAudioSettings(settings) {
+    Audio(AudioSettings settings, std::shared_ptr<Config> config = nullptr)
+        : Component("Audio"), mAudioSettings(settings), mConfig(config) {
     }
     ~Audio();
-
-    /**
-     * @brief Selects and initialises the best available audio backend.
-     *
-     * Populates the list of available backends, picks the one specified in the
-     * AudioSettings (or falls back to a default), and starts the AudioPlayer.
-     */
-    void Init();
 
     /** @brief Returns the currently active AudioPlayer instance. */
     std::shared_ptr<AudioPlayer> GetAudioPlayer();
@@ -71,10 +70,30 @@ class Audio {
     /** @brief (Re)initialises the AudioPlayer for the current backend and channel settings. */
     void InitAudioPlayer();
 
+    /**
+     * @brief Implements audio initialization. Called by Component::Init().
+     *
+     */
+    void OnInit(const nlohmann::json& initArgs = nlohmann::json::object()) override;
+
+    /**
+     * @brief Reads and validates the audio backend from the persisted config.
+     */
+    AudioBackend GetSavedAudioBackend();
+
+    /**
+     * @brief Reads and validates the audio channel layout from the persisted config.
+     */
+    AudioChannelsSetting GetSavedAudioChannelsSetting();
+
   private:
     std::shared_ptr<AudioPlayer> mAudioPlayer;
     AudioBackend mAudioBackend;
     AudioSettings mAudioSettings;
     std::shared_ptr<std::vector<AudioBackend>> mAvailableAudioBackends;
+    std::shared_ptr<Config> mConfig;
+
+    /** @brief Returns the cached Config component. */
+    std::shared_ptr<Config> GetConfig() const;
 };
 } // namespace Ship

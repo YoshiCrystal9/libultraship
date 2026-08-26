@@ -12,11 +12,13 @@ class XMLElement;
 } // namespace tinyxml2
 
 namespace Ship {
+class Keystore;
 /** @brief Byte size of the fixed OTR archive header block. */
 #define OTR_HEADER_SIZE ((size_t)64)
 
 struct File;
 struct ResourceInitData;
+class ResourceManager;
 
 /**
  * @brief Metadata block embedded in an archive's manifest file.
@@ -64,7 +66,8 @@ class Archive : public std::enable_shared_from_this<Archive> {
      * @brief Constructs an Archive for the given filesystem path.
      * @param path Absolute or relative path to the archive file or directory.
      */
-    Archive(const std::string& path);
+    Archive(const std::string& path, std::shared_ptr<ResourceManager> resourceManager = nullptr,
+            std::shared_ptr<Keystore> keystore = nullptr);
     ~Archive();
 
     /** @brief Two archives are equal when they refer to the same underlying path. */
@@ -152,8 +155,17 @@ class Archive : public std::enable_shared_from_this<Archive> {
     /** @brief Returns the filesystem path this archive was opened from. */
     const std::string& GetPath();
 
-    /** @brief Returns true if the archive has been successfully opened. */
-    bool IsLoaded();
+    /** @brief Returns true if the archive has been successfully initialized/opened. */
+    bool IsInitialized();
+
+    /**
+     * @brief Load-order priority assigned by the ArchiveManager when the archive is mounted.
+     * Higher means loaded later. -1 if unset.
+     */
+    int32_t GetPriority();
+
+    /** @brief Sets the load-order priority. Called by the ArchiveManager. */
+    void SetPriority(int32_t priority);
 
     /**
      * @brief Opens the underlying archive file or directory for reading.
@@ -176,8 +188,8 @@ class Archive : public std::enable_shared_from_this<Archive> {
     virtual bool WriteFile(const std::string& filename, const std::vector<uint8_t>& data) = 0;
 
   protected:
-    /** @brief Sets the loaded state flag. Called by Load() / Unload(). */
-    void SetLoaded(bool isLoaded);
+    /** @brief Sets the initialized state flag. Called by Load() / Unload(). */
+    void SetInitialized(bool isInitialized);
     /** @brief Stores the game version parsed from the manifest. */
     void SetGameVersion(uint32_t gameVersion);
     /**
@@ -188,12 +200,16 @@ class Archive : public std::enable_shared_from_this<Archive> {
     /** @brief Validates the manifest checksum and signature, setting mIsSigned / mIsChecksumValid. */
     void Validate();
 
+    std::shared_ptr<ResourceManager> mResourceManager;
+    std::shared_ptr<Keystore> mKeystore;
+
   private:
-    bool mIsLoaded;
+    bool mIsInitialized;
     bool mIsSigned;
     bool mIsChecksumValid;
     bool mHasGameVersion;
     uint32_t mGameVersion;
+    int32_t mPriority = -1;
     ArchiveManifest mManifest;
     std::string mPath;
     std::shared_ptr<std::unordered_map<uint64_t, std::string>> mHashes;

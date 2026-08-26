@@ -4,7 +4,9 @@
 #include "ship/audio/CoreAudioAudioPlayer.h"
 #endif
 
-#include "ship/Context.h"
+#include <stdexcept>
+#include "ship/core/Context.h"
+#include "ship/config/Config.h"
 #include "ship/controller/controldeck/ControlDeck.h"
 
 namespace Ship {
@@ -40,7 +42,7 @@ void Audio::InitAudioPlayer() {
     }
 }
 
-void Audio::Init() {
+void Audio::OnInit(const nlohmann::json& /*initArgs*/) {
     mAvailableAudioBackends = std::make_shared<std::vector<AudioBackend>>();
 #ifdef _WIN32
     mAvailableAudioBackends->push_back(AudioBackend::WASAPI);
@@ -51,7 +53,8 @@ void Audio::Init() {
     mAvailableAudioBackends->push_back(AudioBackend::SDL);
     mAvailableAudioBackends->push_back(AudioBackend::NUL);
 
-    SetCurrentAudioBackend(Context::GetInstance()->GetConfig()->GetCurrentAudioBackend());
+    SetAudioChannels(GetSavedAudioChannelsSetting());
+    SetCurrentAudioBackend(GetSavedAudioBackend());
 }
 
 std::shared_ptr<AudioPlayer> Audio::GetAudioPlayer() {
@@ -62,12 +65,78 @@ AudioBackend Audio::GetCurrentAudioBackend() {
     return mAudioBackend;
 }
 
+AudioBackend Audio::GetSavedAudioBackend() {
+    auto config = GetConfig();
+    std::string backendName = config->GetString("Window.AudioBackend");
+    if (backendName == "wasapi") {
+        return AudioBackend::WASAPI;
+    }
+
+    // Migrate pulse player in config to sdl
+    if (backendName == "pulse") {
+        config->SetString("Window.AudioBackend", "sdl");
+        config->Save();
+        return AudioBackend::SDL;
+    }
+
+    if (backendName == "coreaudio") {
+        return AudioBackend::COREAUDIO;
+    }
+
+    if (backendName == "sdl") {
+        return AudioBackend::SDL;
+    }
+
+    if (backendName == "null") {
+        return AudioBackend::NUL;
+    }
+
+    SPDLOG_TRACE("Could not find AudioBackend matching value from config file ({}). Returning default AudioBackend.",
+                 backendName);
+#ifdef _WIN32
+    return AudioBackend::WASAPI;
+#endif
+
+#ifdef __APPLE__
+    return AudioBackend::COREAUDIO;
+#endif
+
+    return AudioBackend::SDL;
+}
+
 void Audio::SetCurrentAudioBackend(AudioBackend backend) {
+    auto config = GetConfig();
     mAudioBackend = backend;
-    Context::GetInstance()->GetConfig()->SetCurrentAudioBackend(GetCurrentAudioBackend());
-    Context::GetInstance()->GetConfig()->Save();
+
+    switch (backend) {
+        case AudioBackend::WASAPI:
+            config->SetString("Window.AudioBackend", "wasapi");
+            break;
+        case AudioBackend::COREAUDIO:
+            config->SetString("Window.AudioBackend", "coreaudio");
+            break;
+        case AudioBackend::SDL:
+            config->SetString("Window.AudioBackend", "sdl");
+            break;
+        case AudioBackend::NUL:
+            config->SetString("Window.AudioBackend", "null");
+            break;
+        default:
+            config->SetString("Window.AudioBackend", "");
+    }
+    config->Save();
 
     InitAudioPlayer();
+}
+
+std::shared_ptr<Config> Audio::GetConfig() const {
+    if (!mConfig) {
+        throw std::runtime_error("Audio requires Config dependency");
+    }
+    if (!mConfig->IsInitialized()) {
+        throw std::runtime_error("Audio requires Config to be initialized");
+    }
+    return mConfig;
 }
 
 std::shared_ptr<std::vector<AudioBackend>> Audio::GetAvailableAudioBackends() {
@@ -86,6 +155,21 @@ void Audio::SetAudioChannels(AudioChannelsSetting channels) {
 
 AudioChannelsSetting Audio::GetAudioChannels() const {
     return mAudioSettings.ChannelSetting;
+}
+
+AudioChannelsSetting Audio::GetSavedAudioChannelsSetting() {
+    int32_t channelsSetting =
+        GetConfig()->GetInt("CVars." CVAR_AUDIO_CHANNELS_SETTING, static_cast<int32_t>(AudioChannelsSetting::audioMax));
+    switch (channelsSetting) {
+        case AudioChannelsSetting::audioMatrix51:
+            return AudioChannelsSetting::audioMatrix51;
+        case AudioChannelsSetting::audioRaw51:
+            return AudioChannelsSetting::audioRaw51;
+        case AudioChannelsSetting::audioStereo:
+        case AudioChannelsSetting::audioMax:
+        default:
+            return AudioChannelsSetting::audioStereo;
+    }
 }
 
 } // namespace Ship
